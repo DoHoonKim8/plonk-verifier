@@ -12,6 +12,7 @@ num-traits = "0.2.15"
 rand = "0.8"
 hex = "0.4"
 halo2_curves = { git = "https://github.com/privacy-scaling-explorations/halo2curves", tag = "0.3.0", package = "halo2curves" }
+transcript = {git = 'https://github.com/vuvoth/halo2wrong', branch = 'export-hasher-chip'}
 
 # parallel
 rayon = { version = "1.5.3", optional = true }

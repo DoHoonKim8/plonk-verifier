@@ -1,5 +1,5 @@
 use ethereum_types::Address;
-use halo2_curves::bn256::{Bn256, Fq, Fr, G1Affine};
+use halo2_curves::{bn256::{Bn256, Fq, Fr, G1Affine}, FieldExt};
 use halo2_proofs::{
     circuit::{Layouter, SimpleFloorPlanner, Value},
     dev::MockProver,
@@ -27,122 +27,75 @@ use plonk_verifier::{
 };
 use rand::{rngs::OsRng, RngCore};
 use std::rc::Rc;
+use transcript::{
+    HasherChip,
+    maingate::{MainGateConfig, MainGate, RegionCtx, MainGateInstructions}
+};
+use poseidon::Spec;
 
 type Plonk = verifier::Plonk<Kzg<Bn256, Gwc19>>;
 
-#[derive(Clone, Copy)]
-struct StandardPlonkConfig {
-    a: Column<Advice>,
-    b: Column<Advice>,
-    c: Column<Advice>,
-    q_a: Column<Fixed>,
-    q_b: Column<Fixed>,
-    q_c: Column<Fixed>,
-    q_ab: Column<Fixed>,
-    constant: Column<Fixed>,
-    #[allow(dead_code)]
-    instance: Column<Instance>,
+#[derive(Clone)]
+pub struct MerkleTreeCircuitConfig {
+    pub config: MainGateConfig,
 }
 
-impl StandardPlonkConfig {
-    fn configure(meta: &mut ConstraintSystem<Fr>) -> Self {
-        let [a, b, c] = [(); 3].map(|_| meta.advice_column());
-        let [q_a, q_b, q_c, q_ab, constant] = [(); 5].map(|_| meta.fixed_column());
-        let instance = meta.instance_column();
-
-        [a, b, c].map(|column| meta.enable_equality(column));
-
-        meta.create_gate(
-            "q_a·a + q_b·b + q_c·c + q_ab·a·b + constant + instance = 0",
-            |meta| {
-                let [a, b, c] = [a, b, c].map(|column| meta.query_advice(column, Rotation::cur()));
-                let [q_a, q_b, q_c, q_ab, constant] = [q_a, q_b, q_c, q_ab, constant]
-                    .map(|column| meta.query_fixed(column, Rotation::cur()));
-                let instance = meta.query_instance(instance, Rotation::cur());
-                Some(
-                    q_a * a.clone()
-                        + q_b * b.clone()
-                        + q_c * c
-                        + q_ab * a * b
-                        + constant
-                        + instance,
-                )
-            },
-        );
-
-        StandardPlonkConfig {
-            a,
-            b,
-            c,
-            q_a,
-            q_b,
-            q_c,
-            q_ab,
-            constant,
-            instance,
-        }
-    }
+#[derive(Clone, Debug)]
+pub struct MerkleTreeCircuit<F: FieldExt> {
+    pub merkle_proof: Vec<Value<F>>,
+    pub merkle_path: Vec<Value<F>>,
+    pub leaf_node: Value<F>,
+    pub hash_root: Value<F>,
 }
 
-#[derive(Clone, Default)]
-struct StandardPlonk(Fr);
-
-impl StandardPlonk {
-    fn rand<R: RngCore>(mut rng: R) -> Self {
-        Self(Fr::from(rng.next_u32() as u64))
-    }
-
-    fn num_instance() -> Vec<usize> {
-        vec![1]
-    }
-
-    fn instances(&self) -> Vec<Vec<Fr>> {
-        vec![vec![self.0]]
-    }
-}
-
-impl Circuit<Fr> for StandardPlonk {
-    type Config = StandardPlonkConfig;
+impl<F: FieldExt> Circuit<F> for MerkleTreeCircuit<F> {
+    type Config = MerkleTreeCircuitConfig;
     type FloorPlanner = SimpleFloorPlanner;
 
-    fn without_witnesses(&self) -> Self {
-        Self::default()
+    fn configure(meta: &mut transcript::halo2::plonk::ConstraintSystem<F>) -> Self::Config {
+        let config = MainGate::configure(meta);
+        MerkleTreeCircuitConfig { config }
     }
 
-    fn configure(meta: &mut ConstraintSystem<Fr>) -> Self::Config {
-        meta.set_minimum_degree(4);
-        StandardPlonkConfig::configure(meta)
+    fn without_witnesses(&self) -> Self {
+        unimplemented!()
     }
 
     fn synthesize(
         &self,
         config: Self::Config,
-        mut layouter: impl Layouter<Fr>,
-    ) -> Result<(), Error> {
+        mut layouter: impl transcript::halo2::circuit::Layouter<F>,
+    ) -> Result<(), transcript::halo2::plonk::Error> {
+        let config = config.config;
+        // TODO: Check the size of merkle_path and merkle_proof is equal
         layouter.assign_region(
             || "",
-            |mut region| {
-                region.assign_advice(|| "", config.a, 0, || Value::known(self.0))?;
-                region.assign_fixed(|| "", config.q_a, 0, || Value::known(-Fr::one()))?;
+            |region| {
+                let mut ctx = RegionCtx::new(region, 0);
+                let spec = Spec::<F, 3, 2>::new(8, 57);
+                let mut hasher_chip = HasherChip::<F, 0, 0, 3, 2>::new(&mut ctx, &spec, &config)?;
+                let main_gate = hasher_chip.main_gate();
 
-                region.assign_advice(|| "", config.a, 1, || Value::known(-Fr::from(5)))?;
-                for (idx, column) in (1..).zip([
-                    config.q_a,
-                    config.q_b,
-                    config.q_c,
-                    config.q_ab,
-                    config.constant,
-                ]) {
-                    region.assign_fixed(|| "", column, 1, || Value::known(Fr::from(idx)))?;
+                let mut hash_root = main_gate.assign_value(&mut ctx, self.leaf_node)?;
+
+                for (id, hash_value) in self.merkle_proof.iter().enumerate() {
+                    let select = main_gate.assign_value(&mut ctx, self.merkle_path[id])?;
+                    let hash_cell = main_gate.assign_value(&mut ctx, *hash_value)?;
+
+                    let left_child = main_gate.select(&mut ctx, &hash_root, &hash_cell, &select)?;
+                    let right_child =
+                        main_gate.select(&mut ctx, &hash_cell, &hash_root, &select)?;
+
+                    hasher_chip.update(&[left_child, right_child]);
+                    hash_root = hasher_chip.hash(&mut ctx)?;
                 }
 
-                let a = region.assign_advice(|| "", config.a, 2, || Value::known(Fr::one()))?;
-                a.copy_advice(|| "", &mut region, config.b, 3)?;
-                a.copy_advice(|| "", &mut region, config.c, 4)?;
+                let root_cell = main_gate.assign_value(&mut ctx, self.hash_root)?;
 
-                Ok(())
+                main_gate.assert_equal(&mut ctx, &hash_root, &root_cell)
             },
-        )
+        )?;
+        Ok(())
     }
 }
 
@@ -247,12 +200,27 @@ fn evm_verify(deployment_code: Vec<u8>, instances: Vec<Vec<Fr>>, proof: Vec<u8>)
 }
 
 fn main() {
-    let params = gen_srs(8);
+    let params = gen_srs(10);
 
-    let circuit = StandardPlonk::rand(OsRng);
+    let mut leaf = Fr::from(123);
+    let mut merkle_proof = Vec::new();
+    let mut hasher = poseidon::Poseidon::<Fr, 3, 2>::new(8, 57);
+
+    for value in 0..1 {
+        hasher.update(&[leaf, Fr::from(value)]);
+        leaf = hasher.squeeze();
+        merkle_proof.push(Fr::from(value));
+    }
+
+    let circuit = MerkleTreeCircuit {
+        leaf_node: Value::known(Fr::from(123)),
+        merkle_path: (0..1).map(|_| Value::known(Fr::from(1))).collect(),
+        hash_root: Value::known(leaf),
+        merkle_proof: merkle_proof.iter().map(|v| Value::known(*v)).collect(),
+    };
     let pk = gen_pk(&params, &circuit);
-    let deployment_code = gen_evm_verifier(&params, pk.get_vk(), StandardPlonk::num_instance());
+    let deployment_code = gen_evm_verifier(&params, pk.get_vk(), vec![]);
 
-    let proof = gen_proof(&params, &pk, circuit.clone(), circuit.instances());
-    evm_verify(deployment_code, circuit.instances(), proof);
+    let proof = gen_proof(&params, &pk, circuit.clone(), vec![vec![]]);
+    evm_verify(deployment_code, vec![vec![]], proof);
 }
