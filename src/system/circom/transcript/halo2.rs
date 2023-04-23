@@ -72,9 +72,12 @@ impl<
         loader: &Rc<Halo2Loader<'a, C, C::Scalar, BaseFieldEccChip<C, LIMBS, BITS>>>,
         stream: Value<R>,
     ) -> Self {
+        let spec = Spec::new(R_F, R_P);
+        println!("spec mds_matrices : {:?}", spec.mds_matrices());
+        println!("spec constants : {:?}", spec.constants());
         let transcript_chip = TranscriptChip::new(
             &mut loader.ctx_mut(),
-            &Spec::new(R_F, R_P),
+            &spec,
             loader.ecc_chip().clone(),
             E::default(),
         )
